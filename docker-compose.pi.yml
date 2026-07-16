@@ -1,0 +1,77 @@
+# Full edge-relay stack for a 64-bit Raspberry Pi (Postgres + RabbitMQ + the API).
+#
+# On the Pi:
+#   cp .env.pi.example .env      # then fill in real secrets
+#   docker load -i kds-relay-arm64.tar   # image cross-built on the dev machine
+#   docker compose -f docker-compose.pi.yml up -d
+#
+# LAN clients point at  http://<pi-lan-ip>:8080/api/v1
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kds-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kds
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: kds
+    volumes:
+      # Prefer a path on a USB SSD over the SD card — see the deploy notes in README.
+      - kds-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kds -d kds"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: kds-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: kds
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "15672:15672"   # management UI (optional; drop to keep it off the LAN)
+    volumes:
+      - kds-rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  api:
+    image: ${RELAY_IMAGE:-kds-relay:latest}
+    container_name: kds-relay
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=kds;Username=kds;Password=${POSTGRES_PASSWORD}"
+
+      # Relay-issued JWT signing key — MUST be a real 32+ byte secret (see .env).
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
+
+      # Upstream (legacy live API) service credentials.
+      Upstream__BaseUrl: ${UPSTREAM_BASE_URL:-https://api.olouris.co.uk/api/v1}
+      Upstream__ServiceEmail: ${UPSTREAM_EMAIL:?set UPSTREAM_EMAIL in .env}
+      Upstream__ServicePassword: ${UPSTREAM_PASSWORD:?set UPSTREAM_PASSWORD in .env}
+
+      # Feature flags — a production edge box ingests, egresses, and auto-completes.
+      Ingest__Enabled: "true"
+      AutoComplete__Enabled: "true"
+      RabbitMq__Enabled: "true"
+      RabbitMq__Host: rabbitmq
+      RabbitMq__UserName: kds
+      RabbitMq__Password: ${RABBITMQ_PASSWORD}
+
+volumes:
+  kds-pgdata:
+  kds-rabbitmqdata:
